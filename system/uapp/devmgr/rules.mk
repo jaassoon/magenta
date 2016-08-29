@@ -50,7 +50,9 @@ MODULE_STATIC_LIBS := \
     ulib/hid \
     ulib/launchpad \
     ulib/elfload \
+    ulib/mxcpp \
     ulib/mxio \
+    ulib/mxtl \
     ulib/gfx
 
 MODULE_LIBS := ulib/magenta ulib/musl
