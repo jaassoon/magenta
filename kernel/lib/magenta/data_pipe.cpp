@@ -124,7 +124,7 @@ void DataPipe::UpdateSignalsNoLock() {
     }
 }
 
-mx_status_t DataPipe::ProducerWriteFromUser(const void* ptr, mx_size_t* requested) {
+mx_status_t DataPipe::ProducerWriteFromUser(mxtl::user_ptr<const void> ptr, mx_size_t* requested) {
     AutoLock al(&lock_);
 
     // |expected| > 0 means there is a pending ProducerWriteBegin().
@@ -217,7 +217,7 @@ mx_status_t DataPipe::ProducerWriteEnd(mx_size_t written) {
     return NO_ERROR;
 }
 
-mx_status_t DataPipe::ConsumerReadFromUser(void* ptr,
+mx_status_t DataPipe::ConsumerReadFromUser(mxtl::user_ptr<void> ptr,
                                            mx_size_t* requested,
                                            bool all_or_none,
                                            bool discard,

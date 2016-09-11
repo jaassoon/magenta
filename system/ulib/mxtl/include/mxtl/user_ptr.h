@@ -4,6 +4,10 @@
 
 #pragma once
 
+#if _KERNEL
+#include <kernel/vm.h>
+#endif
+
 #if __cplusplus
 
 namespace mxtl {
@@ -22,8 +26,23 @@ public:
     template <typename C>
     user_ptr<C> reinterpret() const { return user_ptr<C>(reinterpret_cast<C*>(ptr_)); }
 
-    operator bool() const { return ptr_ != nullptr; }
+    // special operators to return the nullness of the pointer
+    explicit operator bool() const { return ptr_ != nullptr; }
     bool operator!() { return ptr_ == nullptr; }
+
+    // allow size_t based addition on the pointer
+    user_ptr operator+(size_t add) const {
+        if (ptr_ == nullptr)
+            return user_ptr(nullptr);
+
+        auto ptr = reinterpret_cast<uintptr_t>(ptr_);
+        return user_ptr(reinterpret_cast<T *>(ptr + add));
+    }
+
+#if _KERNEL
+    // check that the address is inside user space
+    bool is_user_address() const { return ::is_user_address(reinterpret_cast<vaddr_t>(ptr_)); }
+#endif
 
 private:
     // It is very important that this class only wrap the pointer type itself
