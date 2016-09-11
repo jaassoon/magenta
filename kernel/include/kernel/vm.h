@@ -67,11 +67,18 @@ extern struct mmu_initial_mapping mmu_initial_mappings[];
 
 /* core per page structure */
 typedef struct vm_page {
-    struct list_node node;
+    struct {
+        uint32_t state : 2;
+        uint32_t flags : 8;
+    };
+    uint32_t map_count;
 
-    uint8_t state;
-    uint8_t flags;
+    // XXX remove
+    struct list_node node;
 } vm_page_t;
+
+// pmm will maintain pages of this size
+#define VM_PAGE_STRUCT_SIZE (sizeof(vm_page_t))
 
 enum vm_page_state {
     VM_PAGE_STATE_FREE,
@@ -109,8 +116,9 @@ static inline bool is_user_address(vaddr_t va) {
 }
 
 /* physical allocator */
-typedef struct pmm_arena {
-    struct list_node node;
+struct vm_page_free;
+
+typedef struct pmm_arena_info {
     const char* name;
 
     uint flags;
@@ -118,17 +126,12 @@ typedef struct pmm_arena {
 
     paddr_t base;
     size_t size;
-
-    size_t free_count;
-
-    struct vm_page* page_array;
-    struct list_node free_list;
-} pmm_arena_t;
+} pmm_arena_info_t;
 
 #define PMM_ARENA_FLAG_KMAP (0x1) /* this arena is already mapped and useful for kallocs */
 
 /* Add a pre-filled memory arena to the physical allocator. */
-status_t pmm_add_arena(pmm_arena_t* arena) __NONNULL((1));
+status_t pmm_add_arena(const pmm_arena_info_t* arena) __NONNULL((1));
 
 /* flags for allocation routines below */
 #define PMM_ALLOC_FLAG_ANY (0x0)  /* no restrictions on which arena to allocate from */

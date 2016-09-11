@@ -16,6 +16,7 @@ MODULE_DEPS += \
 MODULE_SRCS += \
     $(LOCAL_DIR)/bootalloc.cpp \
     $(LOCAL_DIR)/pmm.cpp \
+    $(LOCAL_DIR)/pmm_arena.cpp \
     $(LOCAL_DIR)/vm.cpp \
     $(LOCAL_DIR)/vm_aspace.cpp \
     $(LOCAL_DIR)/vm_object.cpp \

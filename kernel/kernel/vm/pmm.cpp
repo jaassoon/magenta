@@ -13,16 +13,23 @@
 #include <kernel/vm.h>
 #include <lib/console.h>
 #include <list.h>
+#include <new.h>
 #include <pow2.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
 
+#include "pmm_arena.h"
+
+#include <mxtl/intrusive_double_list.h>
+
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
-static struct list_node arena_list = LIST_INITIAL_VALUE(arena_list);
-static mutex_t lock = MUTEX_INITIAL_VALUE(lock);
+static mxtl::DoublyLinkedList<PmmArena *> *arena_list;
+static uint8_t arena_list_buf[sizeof(*arena_list)];
+static Mutex arena_lock;
 
+#if 0
 #define PAGE_BELONGS_TO_ARENA(page, arena)                    \
     (((uintptr_t)(page) >= (uintptr_t)(arena)->page_array) && \
      ((uintptr_t)(page) <                                     \
@@ -34,106 +41,81 @@ static mutex_t lock = MUTEX_INITIAL_VALUE(lock);
 
 #define ADDRESS_IN_ARENA(address, arena) \
     ((address) >= (arena)->base && (address) <= (arena)->base + (arena)->size - 1)
-
-static inline bool page_is_free(const vm_page_t* page) {
-    return page->state == VM_PAGE_STATE_FREE;
-}
+#endif
 
 paddr_t vm_page_to_paddr(const vm_page_t* page) {
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
-        if (PAGE_BELONGS_TO_ARENA(page, a)) {
-            return PAGE_ADDRESS_FROM_ARENA(page, a);
+    for (const auto& a : *arena_list) {
+        //LTRACEF("testing page %p against arena %p\n", page, &a);
+        if (a.page_belongs_to_arena(page)) {
+            return a.page_address_from_arena(page);
         }
     }
     return -1;
 }
 
 vm_page_t* paddr_to_vm_page(paddr_t addr) {
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
-        if (addr >= a->base && addr <= a->base + a->size - 1) {
-            size_t index = (addr - a->base) / PAGE_SIZE;
-            return &a->page_array[index];
+    for (auto& a : *arena_list) {
+        if (a.address_in_arena(addr)) {
+            size_t index = (addr - a.base()) / PAGE_SIZE;
+            return a.get_page(index);
         }
     }
     return NULL;
 }
 
-status_t pmm_add_arena(pmm_arena_t* arena) {
-    LTRACEF("arena %p name '%s' base 0x%lx size 0x%zx\n", arena, arena->name, arena->base,
-            arena->size);
+status_t pmm_add_arena(const pmm_arena_info_t* info) {
+    LTRACEF("arena %p name '%s' base 0x%lx size 0x%zx\n", info, info->name, info->base, info->size);
 
-    DEBUG_ASSERT(IS_PAGE_ALIGNED(arena->base));
-    DEBUG_ASSERT(IS_PAGE_ALIGNED(arena->size));
-    DEBUG_ASSERT(arena->size > 0);
+    DEBUG_ASSERT(IS_PAGE_ALIGNED(info->base));
+    DEBUG_ASSERT(IS_PAGE_ALIGNED(info->size));
+    DEBUG_ASSERT(info->size > 0);
 
-    /* walk the arena list and add arena based on priority order */
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
-        if (a->priority > arena->priority) {
-            list_add_before(&a->node, &arena->node);
+    // allocate a c++ arena object
+    PmmArena *arena = new (boot_alloc_mem(sizeof(PmmArena))) PmmArena(info);
+
+    static bool first = false;
+    if (!first) {
+        first = true;
+        arena_list = new(arena_list_buf) mxtl::DoublyLinkedList<PmmArena *>;
+
+    }
+
+    // walk the arena list and add arena based on priority order
+    LTRACE;
+    for (auto& a : *arena_list) {
+        LTRACE;
+        if (a.priority() > arena->priority()) {
+            LTRACE;
+            arena_list->insert(a, arena);
             goto done_add;
         }
     }
 
-    /* walked off the end, add it to the end of the list */
-    list_add_tail(&arena_list, &arena->node);
+    // walked off the end, add it to the end of the list
+    arena_list->push_back(arena);
 
 done_add:
-
-    /* zero out some of the structure */
-    arena->free_count = 0;
-    list_initialize(&arena->free_list);
-
-    /* allocate an array of pages to back this one */
-    size_t page_count = arena->size / PAGE_SIZE;
-    arena->page_array = (vm_page_t*)boot_alloc_mem(page_count * sizeof(vm_page_t));
-
-    /* initialize all of the pages */
-    memset(arena->page_array, 0, page_count * sizeof(vm_page_t));
-
-    /* add them to the free list */
-    for (size_t i = 0; i < page_count; i++) {
-        vm_page_t* p = &arena->page_array[i];
-
-        list_add_tail(&arena->free_list, &p->node);
-
-        arena->free_count++;
-    }
+    // tell the arena to allocate a page array
+    arena->boot_alloc_array();
 
     return NO_ERROR;
 }
 
 vm_page_t* pmm_alloc_page(uint alloc_flags, paddr_t* pa) {
-    AutoLock al(lock);
+    AutoLock al(arena_lock);
 
     /* walk the arenas in order until we find one with a free page */
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
+    for (auto& a : *arena_list) {
         /* skip the arena if it's not KMAP and the KMAP only allocation flag was passed */
         if (alloc_flags & PMM_ALLOC_FLAG_KMAP) {
-            if ((a->flags & PMM_ARENA_FLAG_KMAP) == 0)
+            if ((a.flags() & PMM_ARENA_FLAG_KMAP) == 0)
                 continue;
         }
-        vm_page_t* page = list_remove_head_type(&a->free_list, vm_page_t, node);
-        if (!page)
-            continue;
 
-        a->free_count--;
-
-        DEBUG_ASSERT(page_is_free(page));
-
-        page->state = VM_PAGE_STATE_ALLOC;
-
-        if (pa) {
-            /* compute the physical address of the page based on its offset into the arena */
-            *pa = PAGE_ADDRESS_FROM_ARENA(page, a);
-        }
-
-        LTRACEF("allocating page %p, pa 0x%lx\n", page, PAGE_ADDRESS_FROM_ARENA(page, a));
-
-        return page;
+        // try to allocate the page out of the arena
+        vm_page_t *page = a.AllocPage(pa);
+        if (page)
+            return page;
     }
 
     LTRACEF("failed to allocate page\n");
@@ -146,34 +128,24 @@ size_t pmm_alloc_pages(size_t count, uint alloc_flags, struct list_node* list) {
     /* list must be initialized prior to calling this */
     DEBUG_ASSERT(list);
 
-    uint allocated = 0;
+    size_t allocated = 0;
     if (count == 0)
         return 0;
 
-    AutoLock al(lock);
+    AutoLock al(arena_lock);
 
     /* walk the arenas in order, allocating as many pages as we can from each */
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
+    for (auto& a : *arena_list) {
         /* skip the arena if it's not KMAP and the KMAP only allocation flag was passed */
         if (alloc_flags & PMM_ALLOC_FLAG_KMAP) {
-            if ((a->flags & PMM_ARENA_FLAG_KMAP) == 0)
+            if ((a.flags() & PMM_ARENA_FLAG_KMAP) == 0)
                 continue;
         }
-        while (allocated < count) {
-            vm_page_t* page = list_remove_head_type(&a->free_list, vm_page_t, node);
-            if (!page)
-                return allocated;
 
-            a->free_count--;
-
-            DEBUG_ASSERT(page_is_free(page));
-
-            page->state = VM_PAGE_STATE_ALLOC;
-            list_add_tail(list, &page->node);
-
-            allocated++;
-        }
+        // if it was successful at allocating any amount of pages, return
+        allocated = a.AllocPages(count, list);
+        if (allocated > 0)
+            break;
     }
 
     return allocated;
@@ -188,31 +160,18 @@ size_t pmm_alloc_range(paddr_t address, size_t count, struct list_node* list) {
 
     address = ROUNDDOWN(address, PAGE_SIZE);
 
-    AutoLock al(lock);
+    AutoLock al(arena_lock);
 
     /* walk through the arenas, looking to see if the physical page belongs to it */
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
-        while (allocated < count && ADDRESS_IN_ARENA(address, a)) {
-            size_t index = (address - a->base) / PAGE_SIZE;
-
-            DEBUG_ASSERT(index < a->size / PAGE_SIZE);
-
-            vm_page_t* page = &a->page_array[index];
-            if (!page_is_free(page)) {
-                /* we hit an allocated page */
+    for (auto& a : *arena_list) {
+        while (allocated < count && a.address_in_arena(address)) {
+            vm_page_t *page = a.AllocSpecific(address);
+            if (!page)
                 break;
-            }
-
-            DEBUG_ASSERT(list_in_list(&page->node));
-
-            list_delete(&page->node);
-            page->state = VM_PAGE_STATE_ALLOC;
 
             if (list)
                 list_add_tail(list, &page->node);
 
-            a->free_count--;
             allocated++;
             address += PAGE_SIZE;
         }
@@ -233,15 +192,20 @@ size_t pmm_alloc_contiguous(size_t count, uint alloc_flags, uint8_t alignment_lo
     if (alignment_log2 < PAGE_SIZE_SHIFT)
         alignment_log2 = PAGE_SIZE_SHIFT;
 
-    AutoLock al(lock);
+    AutoLock al(arena_lock);
 
-    pmm_arena_t* a;
-    list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
+    for (auto& a : *arena_list) {
         /* skip the arena if it's not KMAP and the KMAP only allocation flag was passed */
         if (alloc_flags & PMM_ALLOC_FLAG_KMAP) {
-            if ((a->flags & PMM_ARENA_FLAG_KMAP) == 0)
+            if ((a.flags() & PMM_ARENA_FLAG_KMAP) == 0)
                 continue;
         }
+
+        count = a.AllocContiguous(count, alignment_log2, pa, list);
+        if (count > 0)
+            return count;
+
+#if 0
         /* walk the list starting at alignment boundaries.
          * calculate the starting offset into this arena, based on the
          * base address of the arena to handle the case where the arena
@@ -296,6 +260,7 @@ size_t pmm_alloc_contiguous(size_t count, uint alloc_flags, uint8_t alignment_lo
 
             return count;
         }
+#endif
     }
 
     LTRACEF("couldn't find run\n");
@@ -375,7 +340,7 @@ size_t pmm_free(struct list_node* list) {
 
     DEBUG_ASSERT(list);
 
-    AutoLock al(lock);
+    AutoLock al(arena_lock);
 
     uint count = 0;
     while (!list_is_empty(list)) {
@@ -385,18 +350,15 @@ size_t pmm_free(struct list_node* list) {
         DEBUG_ASSERT(!page_is_free(page));
 
         /* see which arena this page belongs to and add it */
-        pmm_arena_t* a;
-        list_for_every_entry (&arena_list, a, pmm_arena_t, node) {
-            if (PAGE_BELONGS_TO_ARENA(page, a)) {
-                page->state = VM_PAGE_STATE_FREE;
-
-                list_add_head(&a->free_list, &page->node);
-                a->free_count++;
+        for (auto& a : *arena_list) {
+            if (a.FreePage(page) >= 0) {
                 count++;
                 break;
             }
         }
     }
+
+    LTRACEF("returning count %u\n", count);
 
     return count;
 }
@@ -423,43 +385,9 @@ static const char* page_state_to_str(const vm_page_t* page) {
     }
 }
 
-static void dump_page(const vm_page_t* page) {
+void dump_page(const vm_page_t* page) {
     printf("page %p: address 0x%lx state %s flags 0x%x\n", page, vm_page_to_paddr(page),
            page_state_to_str(page), page->flags);
-}
-
-static void dump_arena(const pmm_arena_t* arena, bool dump_pages) {
-    printf("arena %p: name '%s' base 0x%lx size 0x%zx priority %u flags 0x%x\n", arena, arena->name,
-           arena->base, arena->size, arena->priority, arena->flags);
-    printf("\tpage_array %p, free_count %zu\n", arena->page_array, arena->free_count);
-
-    /* dump all of the pages */
-    if (dump_pages) {
-        for (size_t i = 0; i < arena->size / PAGE_SIZE; i++) {
-            dump_page(&arena->page_array[i]);
-        }
-    }
-
-    /* dump the free pages */
-    printf("\tfree ranges:\n");
-    ssize_t last = -1;
-    for (size_t i = 0; i < arena->size / PAGE_SIZE; i++) {
-        if (page_is_free(&arena->page_array[i])) {
-            if (last == -1) {
-                last = i;
-            }
-        } else {
-            if (last != -1) {
-                printf("\t\t0x%lx - 0x%lx\n", arena->base + last * PAGE_SIZE,
-                       arena->base + i * PAGE_SIZE);
-            }
-            last = -1;
-        }
-    }
-
-    if (last != -1) {
-        printf("\t\t0x%lx - 0x%lx\n", arena->base + last * PAGE_SIZE, arena->base + arena->size);
-    }
 }
 
 static int cmd_pmm(int argc, const cmd_args* argv) {
@@ -481,8 +409,9 @@ static int cmd_pmm(int argc, const cmd_args* argv) {
     static struct list_node allocated = LIST_INITIAL_VALUE(allocated);
 
     if (!strcmp(argv[1].str, "arenas")) {
-        pmm_arena_t* a;
-        list_for_every_entry (&arena_list, a, pmm_arena_t, node) { dump_arena(a, false); }
+        for (auto& a : *arena_list) {
+            a.Dump(false);
+        }
     } else if (!strcmp(argv[1].str, "alloc")) {
         if (argc < 3)
             goto notenoughargs;
